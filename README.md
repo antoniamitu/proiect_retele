@@ -976,5 +976,235 @@ with open("server/apps/game.exe", "wb") as f:
 10   client_mara disconnects, server publishes calc v3       mara is offline
 11   client_mara reconnects, CHECK_UPDATES                   Server resynchronizes registry, sends v3
 ```
+Perfect — mai jos ai o variantă **mai concisă, mai academică și curată**, potrivită pentru un README final de proiect. Poți da direct copy-paste.
+
+---
+
+## 26. Client-Side Functionality and Validation
+
+This section describes the client-side implementation, focusing on:
+
+* local application management
+* delayed updates for locked applications
+* retry mechanism for pending updates
+* reconnection behavior
+* isolation between multiple client instances
+
+---
+
+## 27. Client Storage Structure
+
+Each client instance maintains its own isolated directory structure:
+
+```text
+client_instances/<instance_name>/
+├── downloads/
+├── pending_updates/
+└── data/
+    └── client_state.json
+```
+
+This ensures:
+
+* complete separation of installed files
+* independent pending updates
+* isolated local state (`client_state.json`)
+* no interference between instances
+
+---
+
+## 28. Client Commands
+
+The client provides an interactive interface with the following commands:
+
+```text
+help
+list
+download <app_name>
+check
+lock <app_name>
+unlock <app_name>
+state
+pending
+exit
+```
+
+### Description
+
+* `list` — requests available applications from the server
+* `download` — downloads a specific application
+* `check` — checks for updates and downloads them sequentially
+* `lock` / `unlock` — simulate application usage via `.lock` files
+* `state` — displays installed applications
+* `pending` — displays pending updates
+* `exit` — disconnects from the server
+
+---
+
+## 29. Local Update Mechanism
+
+### Direct Installation
+
+If the application is not locked:
+
+* the file is written directly into `downloads/`
+* `client_state.json` is updated immediately
+* an `ACK` is sent after successful installation
+
+### Pending Updates
+
+If the application is locked:
+
+* the update is stored as:
+
+  * `pending_updates/<app>.new`
+  * `pending_updates/<app>.meta`
+* `client_state.json` is not updated
+* `ACK` is still sent
+
+---
+
+## 30. Retry Worker
+
+A background thread periodically attempts to apply pending updates.
+
+If:
+
+* both `.new` and `.meta` exist
+* the application is no longer locked
+
+then:
+
+* the file replaces the installed version (`os.replace`)
+* `client_state.json` is updated
+* temporary files are removed
+
+The worker also removes inconsistent states:
+
+* `.meta` without `.new`
+* `.new` without `.meta`
+
+---
+
+## 31. Client State Representation
+
+`client_state.json` contains only installed applications:
+
+```json
+{
+  "client_id": "client_mara",
+  "apps": {
+    "calculator.exe": {
+      "version": 1,
+      "hash": "..."
+    }
+  }
+}
+```
+
+Important:
+
+* updated only after successful installation in `downloads/`
+* never reflects pending updates
+
+---
+
+## 32. Reconnection Behavior
+
+Upon reconnection, the client automatically:
+
+1. sends `HELLO`
+2. sends `CHECK_UPDATES`
+3. downloads missing updates sequentially
+
+This guarantees consistency even after offline periods.
+
+---
+
+## 33. Running the Client
+
+Start a client instance:
+
+```bash
+python -m client.src.main_client --client-id client_mara --client-instance client_mara
+```
+
+Start multiple isolated instances:
+
+```bash
+python -m client.src.main_client --client-id client_a --client-instance client_a
+python -m client.src.main_client --client-id client_b --client-instance client_b
+```
+
+---
+
+## 34. Generating Demo Applications
+
+To recreate demo applications:
+
+```bash
+python generate_demo_apps.py
+```
+
+This resets:
+
+* application files in `server/apps/`
+* server manifest and registry
+
+Restart the server after execution.
+
+---
+
+## 35. Validation Scripts
+
+### Local Validation
+
+```bash
+python tests/test_client_retry.py
+```
+
+Covers:
+
+* installation logic
+* pending updates
+* retry mechanism
+* orphan cleanup
+* hash validation
+
+### Multi-Instance Validation
+
+```bash
+python tests/validate_two_instances.py
+```
+
+Covers:
+
+* simultaneous clients
+* directory isolation
+* independent state
+
+### Reconnection Validation
+
+```bash
+python tests/validate_reconnect.py
+```
+
+Covers:
+
+* offline updates
+* reconnect behavior
+* automatic synchronization
+
+---
+
+## 36. Summary
+
+The client implementation provides:
+
+* reliable local file management
+* safe update handling under file locks
+* automatic retry for delayed updates
+* consistent state synchronization after reconnect
+* full isolation between multiple client instances
 
 ---
