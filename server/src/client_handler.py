@@ -1,3 +1,4 @@
+# server/src/client_handler.py
 from __future__ import annotations
 
 import select
@@ -16,6 +17,7 @@ from shared.src.protocol import (
     DOWNLOAD,
     FILE_TRANSFER,
     HELLO,
+    INTERNAL_ERROR,
     INVALID_REQUEST,
     LIST_APPS,
     LIST_RESPONSE,
@@ -164,6 +166,21 @@ def _handle_hello(
     return client_id
 
 
+def _send_internal_error(
+    sock: socket_module.socket,
+    header: dict[str, Any],
+    exc: Exception,
+    *,
+    context: str,
+) -> bool:
+    log(f"Internal error during {context}: {exc}")
+    try:
+        send_error(sock, header, INTERNAL_ERROR, "Unexpected server failure")
+    except OSError:
+        return False
+    return True
+
+
 def handle_client(
     sock: socket_module.socket,
     addr,
@@ -227,9 +244,25 @@ def handle_client(
                         break
 
                     if pending_transfer["kind"] == "DOWNLOAD" and client_id is not None:
-                        state_manager.register_download(client_id, pending_transfer["app_name"])
+                        try:
+                            state_manager.register_download(client_id, pending_transfer["app_name"])
+                        except Exception as exc:
+                            if not _send_internal_error(
+                                sock,
+                                header,
+                                exc,
+                                context="ACK download registration",
+                            ):
+                                break
 
                     pending_transfer = None
+                    continue
+
+                if action is None:
+                    try:
+                        send_error(sock, header, MISSING_FIELD, "action is required")
+                    except OSError:
+                        break
                     continue
 
                 if client_id is None and action != HELLO:
@@ -273,6 +306,9 @@ def handle_client(
                             break
                     except OSError:
                         break
+                    except Exception as exc:
+                        if not _send_internal_error(sock, header, exc, context="HELLO"):
+                            break
                     continue
 
                 if action == LIST_APPS:
@@ -280,6 +316,9 @@ def handle_client(
                         _send_list_apps(sock, header["request_id"], state_manager)
                     except OSError:
                         break
+                    except Exception as exc:
+                        if not _send_internal_error(sock, header, exc, context="LIST_APPS"):
+                            break
                     continue
 
                 if action == DOWNLOAD:
@@ -320,6 +359,9 @@ def handle_client(
                             break
                     except OSError:
                         break
+                    except Exception as exc:
+                        if not _send_internal_error(sock, header, exc, context="DOWNLOAD"):
+                            break
                     continue
 
                 if action == CHECK_UPDATES:
@@ -360,6 +402,9 @@ def handle_client(
                             break
                     except OSError:
                         break
+                    except Exception as exc:
+                        if not _send_internal_error(sock, header, exc, context="CHECK_UPDATES"):
+                            break
                     continue
 
                 if action == DISCONNECT:

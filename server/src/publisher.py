@@ -1,3 +1,4 @@
+# server/src/publisher.py
 from __future__ import annotations
 
 from typing import Any
@@ -10,9 +11,10 @@ from server.src.state_manager import PushTask, StateManager
 
 def publish_app(state_manager: StateManager, app_name: str) -> dict[str, Any]:
     """
-    Publishes a new version of an existing app file from server/apps/.
+    Publishes a new version of an already registered app file from server/apps/.
 
-    The operator must overwrite the file on disk first, then call publish.
+    The operator must overwrite the existing file on disk first, then call publish.
+    Structural changes to the app list are not allowed at runtime.
     Returns a small summary dict for logging/UI.
     """
     if not is_valid_app_name(app_name):
@@ -28,9 +30,12 @@ def publish_app(state_manager: StateManager, app_name: str) -> dict[str, Any]:
     with state_manager.lock:
         old_record = state_manager.get_app_record(app_name)
         if old_record is None:
-            version = 1
-        else:
-            version = int(old_record["version"]) + 1
+            raise ValueError(
+                f"App '{app_name}' is not registered in apps_manifest.json. "
+                "Runtime publish only supports new versions of existing apps."
+            )
+
+        version = int(old_record["version"]) + 1
 
         # Use StateManager API instead of mutating internals directly.
         # RLock makes this safe even though these methods also acquire the lock.
