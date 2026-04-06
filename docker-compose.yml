@@ -1,0 +1,17 @@
+# Run from repository root: docker compose up --build
+#
+# Persist manifest, registry, and app binaries on the host (survives container restarts).
+# Clients on the host connect to 127.0.0.1:9000 (Docker Desktop) or the host IP on Linux.
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./server/data:/app/server/data
+      - ./server/apps:/app/server/apps
+    stdin_open: true
+    tty: true

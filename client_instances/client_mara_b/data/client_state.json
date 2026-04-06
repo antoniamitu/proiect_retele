@@ -1,9 +1,4 @@
 {
   "client_id": "client_mara_b",
-  "apps": {
-    "notes.exe": {
-      "version": 1,
-      "hash": "d3e9ce12a6759b1103091856d50fe2e37b1fa87ec7bafc9637a49f059acc29fe"
-    }
-  }
+  "apps": {}
 }

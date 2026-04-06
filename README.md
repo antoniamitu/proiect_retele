@@ -615,8 +615,40 @@ project/
 │       ├── update_manager.py
 │       ├── retry_worker.py
 │       └── local_state.py
+├── generate_demo_apps.py
+├── docker-compose.yml
 └── README.md
 ```
+
+### Running the server (local)
+
+From the **repository root** (so `shared` and `server` resolve correctly):
+
+```bash
+python -m server.src.server_main
+```
+
+The server listens on `0.0.0.0:9000` ([`shared/src/config.py`](shared/src/config.py)). Interactive commands include `publish <app_name>`, `apps`, `clients`, `exit`.
+
+### Running the server (Docker)
+
+Build **from the repository root** (the image copies `shared/` and `server/` into `/app` and sets `PYTHONPATH=/app`):
+
+```bash
+docker build -f server/Dockerfile -t app-store-server .
+docker run --rm -it -p 9000:9000 \
+  -v ./server/data:/app/server/data \
+  -v ./server/apps:/app/server/apps \
+  app-store-server
+```
+
+Or with Compose (same port and volume mounts):
+
+```bash
+docker compose up --build
+```
+
+Clients on the **host** use `127.0.0.1` and port `9000` (Docker Desktop on Windows/macOS; on Linux, use the Docker bridge IP or `host.docker.internal` if configured). The volume mounts keep `apps_manifest.json`, `downloads_registry.json`, and binaries under `server/` on the host so state survives container restarts.
 
 ---
 
@@ -955,6 +987,8 @@ with open("server/apps/game.exe", "wb") as f:
     f.write(os.urandom(20480))
 ```
 
+For **reproducible** demo binaries (same sizes: 1024 / 5120 / 20480 bytes), use [`generate_demo_apps.py`](generate_demo_apps.py) at the repository root; it fills each file by repeating a short label prefix to the exact length and resets the manifest and registry (restart the server afterward).
+
 ---
 
 ## 25. Demo Scenarios
@@ -976,7 +1010,25 @@ with open("server/apps/game.exe", "wb") as f:
 10   client_mara disconnects, server publishes calc v3       mara is offline
 11   client_mara reconnects, CHECK_UPDATES                   Server resynchronizes registry, sends v3
 ```
-Perfect — mai jos ai o variantă **mai concisă, mai academică și curată**, potrivită pentru un README final de proiect. Poți da direct copy-paste.
+
+### 25.1 Demo / video runbook (roles and expected output)
+
+| Role | Responsibility |
+|------|------------------|
+| **Operator** | Runs the server (host or Docker), overwrites files under `server/apps/` before `publish`, types `publish <app_name>` and reads `[PUBLISH ERROR]` / `Published … vN for clients: [...]` |
+| **Client A (`client_mara`)** | `python -m client.src.main_client --client-id client_mara --client-instance client_mara` — `list`, `download`, optional `lock` / `unlock` |
+| **Client B (`client_antonia`)** | Same pattern with `--client-id client_antonia --client-instance client_antonia` |
+| **Client C (`client_auxeniu`)** | Joins later to download current manifest version |
+
+**Suggested order (matches the table above):**
+
+1. **Operator:** start server (`python -m server.src.server_main` or `docker compose up --build`). Expect: `Server listening on 0.0.0.0:9000` and `Available commands:`.
+2. **Clients A & B:** start both; expect `[SERVER] Client connected as …` per HELLO, then `list` shows three apps with versions and hashes.
+3. **Downloads:** each `download` completes with client `Download completed`; server logs show FILE_TRANSFER handling; after ACK, `server/data/downloads_registry.json` lists each `client_id` with downloaded app names.
+4. **Operator:** overwrite `server/apps/calculator.exe`, then `publish calculator.exe`. Expect: `Published calculator.exe v2 for clients: ['client_antonia', 'client_mara']` (or subset). Connected clients should receive `PUSH_UPDATE` and ACK; server should not log ACK timeout for a successful round-trip.
+5. **Offline / reconnect:** disconnect one client (client `exit`); operator publishes again; reconnect same `--client-id` / `--client-instance`. Expect automatic `CHECK_UPDATES` after HELLO, then downloads for newer versions; registry resync if needed (Section 8).
+
+Printable step lists (no automation): [`scripts/run_demo.ps1`](scripts/run_demo.ps1), [`scripts/run_demo.sh`](scripts/run_demo.sh).
 
 ---
 
@@ -1140,18 +1192,15 @@ python -m client.src.main_client --client-id client_b --client-instance client_b
 
 ## 34. Generating Demo Applications
 
-To recreate demo applications:
+To recreate demo applications with the **exact sizes from Section 24** (1024 / 5120 / 20480 bytes, deterministic content):
 
 ```bash
 python generate_demo_apps.py
 ```
 
-This resets:
+This overwrites `calculator.exe`, `notes.exe`, and `game.exe` under `server/apps/`, and resets `server/data/apps_manifest.json` and `server/data/downloads_registry.json` to `{}`.
 
-* application files in `server/apps/`
-* server manifest and registry
-
-Restart the server after execution.
+**Restart the server** after execution so it bootstraps the manifest from disk and recomputes SHA-256 hashes.
 
 ---
 

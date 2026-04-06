@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# Ordered checklist for the project demo / video (see README Section 25 and 25.1).
+
+echo "=== Demo sequence (Auxeniu / server + clients) ==="
+echo ""
+echo "1. [Operator] Generate demo apps (optional clean slate):"
+echo "     python generate_demo_apps.py"
+echo "2. [Operator] Start server (pick one):"
+echo "     python -m server.src.server_main"
+echo "     docker compose up --build"
+echo "   Expect: Server listening on 0.0.0.0:9000"
+echo ""
+echo "3. [Client A] Terminal 1 — client_mara:"
+echo "     python -m client.src.main_client --client-id client_mara --client-instance client_mara"
+echo "4. [Client B] Terminal 2 — client_antonia:"
+echo "     python -m client.src.main_client --client-id client_antonia --client-instance client_antonia"
+echo ""
+echo "5. [Operator] Publish — overwrite server/apps/<app>.exe, then: publish <app_name>"
+echo "6. [Operator] Offline client — exit one client; publish; reconnect."
+echo "7. [Validation] python tests/validate_reconnect.py"
+echo ""

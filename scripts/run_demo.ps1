@@ -1,0 +1,28 @@
+# Ordered checklist for the project demo / video (see README Section 25 and 25.1).
+# Run each step manually; this script only prints the sequence.
+
+Write-Host "=== Demo sequence (Auxeniu / server + clients) ===" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "1. [Operator] Generate demo apps (optional clean slate):"
+Write-Host "     python generate_demo_apps.py"
+Write-Host "2. [Operator] Start server (pick one):"
+Write-Host "     python -m server.src.server_main"
+Write-Host "     docker compose up --build"
+Write-Host "   Expect: Server listening on 0.0.0.0:9000"
+Write-Host ""
+Write-Host "3. [Client A] Terminal 1 — client_mara:"
+Write-Host "     python -m client.src.main_client --client-id client_mara --client-instance client_mara"
+Write-Host "4. [Client B] Terminal 2 — client_antonia:"
+Write-Host "     python -m client.src.main_client --client-id client_antonia --client-instance client_antonia"
+Write-Host "   Both: use interactive commands (list, download, ...)."
+Write-Host ""
+Write-Host "5. [Operator] Publish flow — overwrite server/apps/<app>.exe on disk, then:"
+Write-Host "     publish <app_name>"
+Write-Host "   Expect: Published <app> vN for clients: [...]"
+Write-Host ""
+Write-Host "6. [Operator] Offline client — one client types exit; publish again; reconnect same instance."
+Write-Host "   Expect: CHECK_UPDATES + downloads for newer versions."
+Write-Host ""
+Write-Host "7. [Validation] Automated reconnect test:"
+Write-Host "     python tests/validate_reconnect.py"
+Write-Host ""

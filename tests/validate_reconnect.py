@@ -12,7 +12,7 @@ Scriptul pornește singur serverul și clientul, pregătește datele demo și
 verifică explicit actualizarea pe disk și în client_state.json.
 
 Rulare:
-    python validate_reconnect.py
+    python tests/validate_reconnect.py
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import generate_demo_apps  # noqa: E402 — requires PROJECT_ROOT on sys.path
+
 SERVER_APPS_DIR = PROJECT_ROOT / "server" / "apps"
 SERVER_DATA_DIR = PROJECT_ROOT / "server" / "data"
 APPS_MANIFEST_PATH = SERVER_DATA_DIR / "apps_manifest.json"
@@ -51,8 +53,8 @@ HOST = "127.0.0.1"
 PORT = 9000
 
 APP_NAME = "notes.exe"
-APP_V1_BYTES = b"NOTES_DEMO_V1" * 256
-APP_V2_BYTES = b"NOTES_DEMO_V2" * 256
+APP_V1_BYTES = generate_demo_apps.pad_bytes(b"NOTES_DEMO_V1", 5120)
+APP_V2_BYTES = generate_demo_apps.pad_bytes(b"NOTES_DEMO_V2", 5120)
 
 PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"
@@ -87,12 +89,8 @@ def section(title: str) -> None:
 # ---------------------------------------------------------------------------
 
 def write_demo_apps() -> None:
-    SERVER_APPS_DIR.mkdir(parents=True, exist_ok=True)
     SERVER_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    (SERVER_APPS_DIR / "calculator.exe").write_bytes(b"CALCULATOR_DEMO_V1" * 64)
-    (SERVER_APPS_DIR / "notes.exe").write_bytes(APP_V1_BYTES)
-    (SERVER_APPS_DIR / "game.exe").write_bytes(b"GAME_DEMO_V1" * 1024)
+    generate_demo_apps.write_demo_app_binaries(reset_manifest=False)
 
 
 def reset_server_state() -> None:

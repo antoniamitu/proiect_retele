@@ -2,19 +2,19 @@
   "calculator.exe": {
     "name": "calculator.exe",
     "version": 1,
-    "hash": "3da04dc63c9e76581e0fc1523df19a96d99b63541561196ede7900ac01464b90",
+    "hash": "eb1ddecd66d9ab796c7e7570da4bdcaaa832c2e3d038d8339f92abfbda9a16f1",
     "file_path": "calculator.exe"
   },
   "game.exe": {
     "name": "game.exe",
     "version": 1,
-    "hash": "0161b3ad9d43554399cc3c6f1cb6a3d4b0921ae93f305d3177a4ad2fce2258b4",
+    "hash": "d4ab2ce0d7a39c832914ab1c1545b574b3985ac331cab3916804a9a9c9ce9896",
     "file_path": "game.exe"
   },
   "notes.exe": {
     "name": "notes.exe",
-    "version": 2,
-    "hash": "aa3744d83e2cb71e26c9f20b572b05a5057764452a508b247baf6c1182be2dd4",
+    "version": 1,
+    "hash": "e870ba8a3e8dc7d6958a234a7e5b0198a2e9a8094b680b299daf6d81685e0515",
     "file_path": "notes.exe"
   }
 }

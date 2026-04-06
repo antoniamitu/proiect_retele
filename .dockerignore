@@ -1,0 +1,8 @@
+.git
+.cursor
+**/__pycache__
+**/*.pyc
+client
+client_instances
+tests
+*.md

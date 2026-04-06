@@ -1,0 +1,9 @@
+{
+  "client_id": "client_mara",
+  "apps": {
+    "calculator.exe": {
+      "version": 1,
+      "hash": "eb1ddecd66d9ab796c7e7570da4bdcaaa832c2e3d038d8339f92abfbda9a16f1"
+    }
+  }
+}
