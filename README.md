@@ -1,596 +1,72 @@
-## 1. Network Configuration
+# Client–Server Application Distribution and Update System
 
-**File: `shared/src/config.py`**
+A team project implementing a **TCP client–server system for application distribution, version management, and automatic updates**.
 
-```python
-HOST = "0.0.0.0"       # server listens on all interfaces (needed for Docker)
-PORT = 9000
-BUFFER_SIZE = 4096
-SOCKET_TIMEOUT = 5      # seconds — used for select() polling interval
-FRAME_TIMEOUT = 10      # seconds — max time to read a complete frame once select() triggers
-ACK_TIMEOUT = 10        # seconds — max wait for ACK after file transfer
-RETRY_INTERVAL = 5      # seconds — client retry worker interval
-```
+The system allows multiple clients to connect to a central server, view available applications, download files, receive new versions automatically, and synchronize their local state after reconnecting.
 
-Clients use `SERVER_HOST = "127.0.0.1"` (or the Docker host IP) and `SERVER_PORT = 9000` in their own config.
+The project implements a custom communication protocol over TCP sockets, binary file transfers, acknowledgment-based transfer validation, SHA-256 integrity checks, concurrent client handling, persistent state management, automatic update delivery, delayed updates for locked applications, and Docker-based server deployment.
 
 ---
 
-## 2. Protocol Framing
+## Main Features
 
-**File: `shared/src/protocol.py`**
+### Client–Server Communication
 
-Every message on the wire:
+The system uses TCP sockets for communication between a central server and multiple clients.
 
-```
-[4 bytes: JSON header length, big-endian unsigned int]
-[N bytes: JSON header, UTF-8 encoded]
-[if "file_size" > 0 in JSON: exactly file_size bytes of raw binary data]
-```
+The server:
 
-Rules:
-- The 4-byte length covers **only** the JSON portion.
-- If the JSON header contains `"file_size"` with a value > 0, the receiver reads exactly that many additional bytes. If `"file_size"` is absent or 0, there is no binary payload.
-- Messages that carry binary payload: `FILE_TRANSFER`, `PUSH_UPDATE`. All others have no binary payload.
+* accepts multiple client connections;
+* maintains the list of available applications and their versions;
+* handles application downloads;
+* tracks which applications were downloaded by each client;
+* publishes new application versions;
+* automatically pushes updates to connected clients;
+* synchronizes offline clients when they reconnect.
 
-**Sending:**
+The clients:
 
-```python
-import struct, json
-
-def send_message(sock, header_dict, file_data=None):
-    header = dict(header_dict)  # shallow copy, never mutate caller's dict
-    if file_data is not None:
-        header["file_size"] = len(file_data)
-    else:
-        header.pop("file_size", None)
-    json_bytes = json.dumps(header).encode("utf-8")
-    sock.sendall(struct.pack("!I", len(json_bytes)))
-    sock.sendall(json_bytes)
-    if file_data is not None:
-        sock.sendall(file_data)
-```
-
-**Receiving:**
-
-```python
-def recv_exact(sock, n):
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(min(n - len(buf), BUFFER_SIZE))
-        if not chunk:
-            raise ConnectionError("Socket closed")
-        buf.extend(chunk)
-    return bytes(buf)
-
-def recv_message(sock):
-    raw_length = recv_exact(sock, 4)
-    json_length = struct.unpack("!I", raw_length)[0]
-    json_bytes = recv_exact(sock, json_length)
-    header = json.loads(json_bytes.decode("utf-8"))
-    file_data = None
-    if header.get("file_size", 0) > 0:
-        file_data = recv_exact(sock, header["file_size"])
-    return header, file_data
-```
-
-**Critical frame-reading rule:** `recv_message()` must never be called without first verifying data is available via `select.select()`. Once `select()` triggers, the caller sets `sock.settimeout(FRAME_TIMEOUT)` inside a `try/finally` block that guarantees `sock.settimeout(None)` is restored regardless of outcome. If `socket.timeout` occurs during frame reading, the connection is considered **compromised and must be closed** — no attempt to resume or save partial data.
-
-**Two-level error separation:**
-
-Protocol-level errors — **close the connection immediately, no ERROR response:**
-- `socket.timeout` during frame reading
-- `json.JSONDecodeError`
-- `UnicodeDecodeError`
-- Decoded header is not a `dict`
-- `file_size` is present but is not a non-negative `int`
-
-Message-level errors — **send an ERROR response, keep the connection open:**
-- Unknown `action`
-- Missing required field (`app_name`, `ack_for_request_id`, etc.)
-- Invalid `app_name` (contains `/`, `\`, or `..`)
-- `APP_NOT_FOUND`
-- Unexpected `ACK` (no `pending_transfer` exists)
-
-**`send_error` helper rule:** When sending an ERROR response, use `request_id` from the received header if it exists and is an integer, otherwise use `0`.
-
-These two functions are in `shared/src/protocol.py`. Everyone uses them. Nobody writes custom socket logic.
-
-**Note for future/real projects:** For large files, read/send in chunks to avoid loading entire files into RAM. For this school project with small demo files, the current approach is fine.
+* register with the server using a unique `client_id`;
+* request the list of available applications;
+* download applications;
+* verify file integrity;
+* receive pushed updates;
+* store application state locally;
+* detect available updates after reconnecting;
+* delay updates when an application is currently locked.
 
 ---
 
-## 3. Message Types — Complete List
+## Technologies Used
 
-**File: `shared/src/protocol.py`**
+* Python 3
+* TCP sockets
+* Python `threading`
+* Python `select`
+* JSON
+* SHA-256 hashing
+* File system operations
+* Docker
+* Docker Compose
 
-```python
-# Client -> Server
-HELLO = "HELLO"
-LIST_APPS = "LIST_APPS"
-DOWNLOAD = "DOWNLOAD"
-CHECK_UPDATES = "CHECK_UPDATES"
-ACK = "ACK"
-DISCONNECT = "DISCONNECT"
+The Docker server image is based on:
 
-# Server -> Client
-LIST_RESPONSE = "LIST_RESPONSE"
-FILE_TRANSFER = "FILE_TRANSFER"
-PUSH_UPDATE = "PUSH_UPDATE"
-CHECK_UPDATES_RESPONSE = "CHECK_UPDATES_RESPONSE"
-ERROR = "ERROR"
+```text
+python:3.12-slim
 ```
 
 ---
 
-## 4. Universal Message Rules
+## Project Structure
 
-These apply to **every single message**, no exceptions:
-
-1. **Every message contains `"action"`** — how the receiver identifies the message type.
-2. **Every message contains `"request_id"`** — integer.
-   - Client-initiated messages: the client increments from 1 (1, 2, 3, ...).
-   - Server responses to client requests: echo back the same `request_id`.
-   - Server-initiated pushes (`PUSH_UPDATE`): the server has its own counter, starting from 1001, incrementing. Every push gets a unique ID.
-3. **`"client_id"` is sent only in HELLO.** After HELLO, the server knows which client owns the socket. Subsequent messages do not include `client_id`.
-4. **Every server→client message contains `"status"`**: either `"OK"` or `"ERROR"`.
-5. **ACK never receives a response.** The server processes the ACK internally and sends nothing back.
-6. **ACK contains `"ack_for_request_id"`** — the `request_id` of the message being acknowledged.
-7. **`request_id` validation:** Every message must include `request_id`. If `request_id` is missing, the server responds with `MISSING_FIELD`. If `request_id` exists but is not an integer, the server responds with `INVALID_REQUEST`. In both cases the connection stays open.
-8. **No pipelining.** Only one active flow on a socket at a time. The client does not send a new request until the previous flow has finished. After receiving FILE_TRANSFER or PUSH_UPDATE, the next message from the client **must** be the corresponding ACK.
-9. **`app_name` validation:** `app_name` must be a simple filename with no path separators (`/`, `\`) and no `..` (double dot). The server responds with `INVALID_REQUEST` for any request with an invalid `app_name`.
-10. **Pending transfer violation rule:** If `pending_transfer` is not `None` (the server is waiting for an ACK), the next client message **must** be a valid ACK with `ack_for_request_id` matching `pending_transfer["request_id"]`. Any other message — or an ACK with the wrong `ack_for_request_id` — is treated as `INVALID_REQUEST` and the **connection is closed**. This is the one message-level error that causes connection closure, because the protocol state has become unrecoverable.
-
----
-
-## 5. HELLO — Mandatory First Message
-
-**Client sends immediately after TCP connect:**
-
-```json
-{
-  "action": "HELLO",
-  "request_id": 1,
-  "client_id": "client_mara"
-}
-```
-
-**Server responds:**
-
-```json
-{
-  "status": "OK",
-  "action": "HELLO",
-  "request_id": 1,
-  "message": "Welcome, client_mara"
-}
-```
-
-**Rules:**
-- The server rejects any non-HELLO message on a socket that hasn't completed HELLO, responding with ERROR code `CLIENT_NOT_REGISTERED`.
-- After HELLO, the server maps this socket to `client_id` in `active_clients`. All subsequent messages on this socket are attributed to that `client_id` automatically.
-- **Duplicate client_id:** If `client_mara` is already in `active_clients` (old connection not yet cleaned up), the new connection **wins**. The server closes the old socket and replaces it. See Section 23 for race-condition-safe cleanup.
-
----
-
-## 6. LIST_APPS
-
-**Client sends:**
-
-```json
-{
-  "action": "LIST_APPS",
-  "request_id": 2
-}
-```
-
-**Server responds:**
-
-```json
-{
-  "status": "OK",
-  "action": "LIST_RESPONSE",
-  "request_id": 2,
-  "apps": [
-    {
-      "name": "calculator.exe",
-      "version": 1,
-      "hash": "a3f2b8c..."
-    },
-    {
-      "name": "notes.exe",
-      "version": 3,
-      "hash": "f7d1e9a..."
-    },
-    {
-      "name": "game.exe",
-      "version": 1,
-      "hash": "b8e4c2d..."
-    }
-  ]
-}
-```
-
----
-
-## 7. DOWNLOAD
-
-**Client sends:**
-
-```json
-{
-  "action": "DOWNLOAD",
-  "request_id": 3,
-  "app_name": "calculator.exe"
-}
-```
-
-**Server responds (header + binary payload):**
-
-```json
-{
-  "status": "OK",
-  "action": "FILE_TRANSFER",
-  "request_id": 3,
-  "app_name": "calculator.exe",
-  "version": 2,
-  "hash": "a3f2b8c...",
-  "file_size": 102400
-}
-```
-followed by exactly 102400 bytes of binary data.
-
-**Important:** `pending_transfer` is set **after** `send_message()` succeeds, not before. If the send fails, the server must not remain in a false "waiting for ACK" state.
-
-**Client verifies hash, saves file to disk, then sends ACK:**
-
-```json
-{
-  "action": "ACK",
-  "request_id": 4,
-  "ack_for_request_id": 3,
-  "app_name": "calculator.exe",
-  "version": 2
-}
-```
-
-**No server response to ACK.** The server receives the ACK, registers the download in `downloads_registry.json`, and continues.
-
-The flow is exactly 3 steps:
-1. Client sends DOWNLOAD
-2. Server sends FILE_TRANSFER + binary
-3. Client sends ACK
-
-**ACK is sent only after:** hash verified AND file successfully saved to disk (either to `downloads/` or `pending_updates/`). If either fails, no ACK is sent.
-
----
-
-## 8. CHECK_UPDATES (on reconnection)
-
-**Client sends:**
-
-```json
-{
-  "action": "CHECK_UPDATES",
-  "request_id": 2,
-  "local_apps": [
-    {
-      "name": "calculator.exe",
-      "version": 1,
-      "hash": "old_hash..."
-    },
-    {
-      "name": "notes.exe",
-      "version": 3,
-      "hash": "current_hash..."
-    }
-  ]
-}
-```
-
-**Server processing:**
-
-1. Compare each app in `local_apps` against `self.apps` to find newer versions.
-2. **Registry resynchronization:** For each app in `local_apps` that exists on the server, the server adds it to `self.downloads[client_id]` if not already present (using `self.downloads.setdefault(client_id, set())`). This repairs lost ACKs: if the client has the app but the server's registry doesn't know, this corrects the state so future pushes work correctly.
-3. Save `downloads_registry.json` if anything changed.
-
-**Server responds — only lists apps with newer versions:**
-
-```json
-{
-  "status": "OK",
-  "action": "CHECK_UPDATES_RESPONSE",
-  "request_id": 2,
-  "updates": [
-    {
-      "name": "calculator.exe",
-      "version": 2,
-      "hash": "new_hash..."
-    }
-  ]
-}
-```
-
-If no updates, `"updates"` is `[]`.
-
-After receiving this, the client sends a DOWNLOAD for each app in `updates`, one at a time, using the normal DOWNLOAD → FILE_TRANSFER → ACK flow.
-
----
-
-## 9. PUSH_UPDATE (server push)
-
-When someone publishes a new version, the server pushes to all connected clients who previously downloaded that app. The publisher places a push task in the client's pending pushes dict. The handler thread picks it up **only when there is no pending input from the client and no pending transfer awaiting ACK**, sends it, and handles the ACK when it arrives through the normal recv loop. **The handler never blocks waiting for ACK inline.**
-
-**Server sends (via handler thread, header + binary payload):**
-
-```json
-{
-  "status": "OK",
-  "action": "PUSH_UPDATE",
-  "request_id": 1001,
-  "app_name": "calculator.exe",
-  "version": 3,
-  "hash": "newest_hash...",
-  "file_size": 103000
-}
-```
-followed by exactly 103000 bytes of binary data.
-
-Each PUSH_UPDATE gets a unique `request_id` from the server's own counter (starting at 1001, incrementing).
-
-**Important:** `pending_transfer` is set **after** `send_message()` succeeds, not before. If the send fails, the handler catches the exception and breaks out of the loop (client disconnected).
-
-**Client verifies hash, saves file to disk, then sends ACK:**
-
-```json
-{
-  "action": "ACK",
-  "request_id": 5,
-  "ack_for_request_id": 1001,
-  "app_name": "calculator.exe",
-  "version": 3
-}
-```
-
-**No server response to ACK.** The handler receives the ACK through the normal recv loop, matches it via `ack_for_request_id`, and continues. `downloads_registry.json` is **not** modified for pushes — the app was already associated with this client.
-
-**ACK is sent only after:** hash verified AND file successfully saved to disk (to `downloads/` or `pending_updates/`). If either fails, no ACK is sent.
-
----
-
-## 10. What Happens If ACK Does Not Arrive
-
-After sending FILE_TRANSFER or PUSH_UPDATE, the server does **not** block waiting for ACK. Instead, the handler continues its normal loop. However, if ACK does not arrive within `ACK_TIMEOUT` (10 seconds) — measured from when the file was sent — the server considers the transfer failed:
-
-- The download is **not** registered.
-- The server logs the failure.
-- The connection is closed.
-
-The handler tracks this with the `pending_transfer` structure (see Section 19).
-
----
-
-## 11. DISCONNECT
-
-**Client sends before closing:**
-
-```json
-{
-  "action": "DISCONNECT",
-  "request_id": 6
-}
-```
-
-The server cleans up the active socket but **keeps** the download history. No response is sent — the client closes the socket immediately after.
-
-If the client crashes without sending DISCONNECT, the server detects it via socket error and does the same cleanup.
-
----
-
-## 12. ERROR Responses
-
-**Format:**
-
-```json
-{
-  "status": "ERROR",
-  "action": "ERROR",
-  "request_id": 3,
-  "code": "APP_NOT_FOUND",
-  "message": "The application 'foo.exe' does not exist."
-}
-```
-
-`request_id` is taken from the received header if it exists and is an integer, otherwise `0`.
-
-**Complete list of error codes:**
-
-```
-INVALID_REQUEST       — unknown action, invalid app_name (contains /, \, or ..),
-                        unexpected ACK when no transfer is pending,
-                        protocol violation during pending_transfer
-                        (wrong message type or wrong ack_for_request_id),
-                        or non-integer request_id
-
-MISSING_FIELD         — a required field is missing from an otherwise valid message,
-                        including missing request_id
-
-APP_NOT_FOUND         — the requested app_name does not exist on the server
-
-CLIENT_NOT_REGISTERED — any action received on a socket before HELLO has completed
-
-INTERNAL_ERROR        — unexpected server failure
-```
-
-**When errors close the connection vs. keep it open:**
-
-Errors that **close** the connection (protocol is unrecoverable) — no ERROR response sent:
-- Protocol-level frame corruption: timeout mid-frame, `json.JSONDecodeError`, `UnicodeDecodeError`, non-dict header, invalid `file_size` type or negative value.
-
-Errors that **close** the connection — ERROR response sent first:
-- Pending transfer violation: any message other than the correct ACK arrives while `pending_transfer` is set.
-
-Errors that **keep** the connection open — ERROR response sent:
-- `MISSING_FIELD` — client can retry with a corrected message. This includes missing `request_id`.
-- `APP_NOT_FOUND` — client can try a different app.
-- `CLIENT_NOT_REGISTERED` — client can send HELLO.
-- `INVALID_REQUEST` for unknown action, invalid `app_name`, unexpected ACK (when no `pending_transfer`), or non-integer `request_id` — connection stays open.
-- `INTERNAL_ERROR` — connection stays open.
-
----
-
-## 13. Hash, Version, and Client Identity
-
-**File: `shared/src/hash_utils.py`**
-
-```python
-import hashlib
-
-def compute_hash(file_data: bytes) -> str:
-    return hashlib.sha256(file_data).hexdigest()
-```
-
-- **Hash:** lowercase hexadecimal SHA-256 (64 characters).
-- **Version:** integer starting at 1, incremented by 1 on each publish. Version determines "newer." Hash is for integrity verification on the client.
-- **Client IDs:** fixed per client instance — `client_antonia`, `client_mara`, `client_auxeniu`. Defined in each client's config file. Stable across reconnections. Sent **only** in HELLO. After that, the server deduces identity from the socket mapping.
-
----
-
-## 14. Server Data Structures (in memory)
-
-**File: `server/src/state_manager.py`**
-
-```python
-import threading
-
-class StateManager:
-    def __init__(self):
-        self.lock = threading.Lock()
-
-        # Persistent: app_name -> {"name", "version", "hash", "file_path"}
-        self.apps = {}
-
-        # Persistent: client_id -> set of app_names
-        # On load from JSON: list -> set
-        # On save to JSON: set -> sorted list
-        self.downloads = {}
-
-        # Live only: client_id -> socket object
-        self.active_clients = {}
-
-        # Live only: client_id -> dict[app_name] -> push_task
-        # Only keeps latest version per app
-        self.pending_pushes = {}
-
-        # Server-side request_id counter for PUSH_UPDATE messages
-        self.server_request_id = 1000  # incremented before each use
-```
-
-Key design points:
-- **No per-client socket locks.** Only one thread (the handler) ever touches each socket.
-- **`pending_pushes`** is a dict of dicts. For each client, it maps `app_name → latest_task`. If the server publishes v2 then v3 quickly, only v3 is kept.
-- **`self.downloads` stores sets in memory**, converted to sorted lists when saving to JSON, converted back to sets when loading.
-- `self.lock` protects all reads and writes to all structures.
-- **Always use `setdefault` when accessing entries that may not exist yet:** `self.downloads.setdefault(client_id, set())` and `self.pending_pushes.setdefault(client_id, {})`.
-
----
-
-## 15. State Persistence — JSON Files
-
-**Server:**
-
-`server/data/apps_manifest.json`
-```json
-{
-  "calculator.exe": {
-    "name": "calculator.exe",
-    "version": 2,
-    "hash": "a3f2b8c...",
-    "file_path": "calculator.exe"
-  },
-  "notes.exe": {
-    "name": "notes.exe",
-    "version": 1,
-    "hash": "f7d1e9a...",
-    "file_path": "notes.exe"
-  }
-}
-```
-
-`file_path` stores **only the filename**. The actual path is built at runtime from a config constant `APPS_DIR`.
-
-`server/data/downloads_registry.json`
-```json
-{
-  "client_mara": ["calculator.exe", "notes.exe"],
-  "client_antonia": ["calculator.exe"],
-  "client_auxeniu": []
-}
-```
-
-Lists are **sorted alphabetically** when saved. On load, converted to sets.
-
-**Client:**
-
-`client/data/client_state.json`
-```json
-{
-  "client_id": "client_mara",
-  "apps": {
-    "calculator.exe": {
-      "version": 1,
-      "hash": "old_hash..."
-    },
-    "notes.exe": {
-      "version": 3,
-      "hash": "current_hash..."
-    }
-  }
-}
-```
-
-**`client_state.json` reflects only what is actually installed in `downloads/`.** It is never updated when a file is placed in `pending_updates/`. It is updated only when the file is actually applied to `downloads/`.
-
-**When to save:**
-- Server: immediately after registering a download (ACK received for DOWNLOAD), after a publish, and after CHECK_UPDATES resynchronization.
-- Client: immediately after a file is written to `downloads/` (either directly or by the retry worker via `os.replace`). Never when writing to `pending_updates/`.
-
----
-
-## 16. Client-Side Thread Safety
-
-**File: `client/src/local_state.py`**
-
-The client has two threads that can modify local state:
-- The main/listener thread (receives files, writes to downloads or pending_updates).
-- The retry worker (applies pending updates, writes to downloads).
-
-A single `threading.Lock()` protects:
-- All reads/writes to `client_state.json`.
-- All file operations in `downloads/` and `pending_updates/`.
-
-```python
-import threading
-
-class LocalState:
-    def __init__(self):
-        self.lock = threading.Lock()
-        # ... state loading logic
-```
-
-Every file write or state update goes through `with self.lock:`.
-
----
-
-## 17. Folder Structure
-
-```
+```text
 project/
 ├── shared/
 │   └── src/
 │       ├── config.py
 │       ├── protocol.py
 │       └── hash_utils.py
+│
 ├── server/
 │   ├── apps/
 │   │   ├── calculator.exe
@@ -605,6 +81,7 @@ project/
 │   │   ├── state_manager.py
 │   │   └── publisher.py
 │   └── Dockerfile
+│
 ├── client/
 │   ├── downloads/
 │   ├── pending_updates/
@@ -615,532 +92,432 @@ project/
 │       ├── update_manager.py
 │       ├── retry_worker.py
 │       └── local_state.py
+│
+├── client_instances/
+├── tests/
+│   ├── test_client_retry.py
+│   ├── validate_two_instances.py
+│   └── validate_reconnect.py
+│
+├── scripts/
+│   ├── run_demo.ps1
+│   └── run_demo.sh
+│
 ├── generate_demo_apps.py
 ├── docker-compose.yml
 └── README.md
 ```
 
-### Running the server (local)
-
-From the **repository root** (so `shared` and `server` resolve correctly):
-
-```bash
-python -m server.src.server_main
-```
-
-The server listens on `0.0.0.0:9000` ([`shared/src/config.py`](shared/src/config.py)). Interactive commands include `publish <app_name>`, `apps`, `clients`, `exit`.
-
-### Running the server (Docker)
-
-Build **from the repository root** (the image copies `shared/` and `server/` into `/app` and sets `PYTHONPATH=/app`):
-
-```bash
-docker build -f server/Dockerfile -t app-store-server .
-docker run --rm -it -p 9000:9000 \
-  -v ./server/data:/app/server/data \
-  -v ./server/apps:/app/server/apps \
-  app-store-server
-```
-
-Or with Compose (same port and volume mounts):
-
-```bash
-docker compose up --build
-```
-
-Clients on the **host** use `127.0.0.1` and port `9000` (Docker Desktop on Windows/macOS; on Linux, use the Docker bridge IP or `host.docker.internal` if configured). The volume mounts keep `apps_manifest.json`, `downloads_registry.json`, and binaries under `server/` on the host so state survives container restarts.
-
 ---
 
-## 18. Publishing a New Version
+## Network Configuration
 
-**File: `server/src/publisher.py`**
-
-Triggered by server operator typing `publish calculator.exe` in server console.
-
-Steps:
-1. Read the new file from `APPS_DIR/calculator.exe`.
-2. Compute SHA-256 hash.
-3. Acquire `state_manager.lock`.
-4. Increment version by 1.
-5. Update `self.apps["calculator.exe"]` with new version and hash.
-6. Save `apps_manifest.json` to disk.
-7. Get list of client_ids from `self.downloads` who have this app.
-8. Increment `self.server_request_id`.
-9. For each such client that is in `self.active_clients`: use `self.pending_pushes.setdefault(client_id, {})` then set `self.pending_pushes[client_id]["calculator.exe"]` to a push task containing `{"request_id": ..., "app_name": ..., "version": ..., "hash": ..., "file_data": ...}`. If a previous push for the same app was pending, it is overwritten (only latest version kept).
-10. Release `state_manager.lock`.
-11. Disconnected clients get the update via CHECK_UPDATES when they reconnect.
-
-The publisher **never touches any socket directly**. It only writes to `pending_pushes`.
-
----
-
-## 19. Server Concurrency Model — Single Thread Per Socket, Event-Driven
-
-**File: `server/src/server_main.py` and `server/src/client_handler.py`**
-
-- One main thread runs `socket.accept()` in a loop.
-- Each new connection spawns a `threading.Thread` running `client_handler.handle_client(sock, addr, state_manager)`.
-- **Only this handler thread reads from and writes to that socket. No exceptions.**
-
-**Pending transfer tracking:**
-
-The handler uses a single structured variable:
-
-```python
-pending_transfer = None
-# When a file is sent successfully, this becomes:
-# {
-#     "request_id": 3,
-#     "kind": "DOWNLOAD" or "PUSH_UPDATE",
-#     "app_name": "calculator.exe",
-#     "version": 2,
-#     "since": time.time()
-# }
-```
-
-**`pending_transfer` is set only after `send_message()` succeeds.** If the send raises an exception, the handler catches it and breaks (client disconnected), never entering a false "waiting for ACK" state.
-
-**Handler thread loop:**
-
-```python
-import select, time, json
-import socket as socket_module
-
-def handle_client(sock, addr, state_manager):
-    client_id = None
-    pending_transfer = None
-
-    while True:
-        # 1. Check ACK timeout
-        if pending_transfer is not None:
-            if time.time() - pending_transfer["since"] > ACK_TIMEOUT:
-                log(f"ACK timeout for {client_id}, closing")
-                break
-
-        # 2. Check if socket has data available (using select)
-        readable, _, _ = select.select([sock], [], [], SOCKET_TIMEOUT)
-
-        if readable:
-            # 3. Data available — set temporary frame timeout in try/finally
-            try:
-                sock.settimeout(FRAME_TIMEOUT)
-                header, file_data = recv_message(sock)
-            except socket_module.timeout:
-                log(f"Incomplete frame from {client_id}, closing")
-                break
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                log(f"Corrupted frame from {client_id}, closing")
-                break
-            except (ConnectionError, ConnectionResetError, OSError):
-                break
-            finally:
-                sock.settimeout(None)
-
-            # 3a. Validate header is a dict
-            if not isinstance(header, dict):
-                log(f"Non-dict header from {client_id}, closing")
-                break
-
-            # 3b. Validate file_size type if present
-            if "file_size" in header and (
-                not isinstance(header["file_size"], int)
-                or header["file_size"] < 0
-            ):
-                log(f"Invalid file_size from {client_id}, closing")
-                break
-
-            # 3c. Validate request_id
-            if "request_id" not in header:
-                send_error(sock, header, "MISSING_FIELD",
-                    "request_id is required")
-                continue
-            if not isinstance(header["request_id"], int):
-                send_error(sock, header, "INVALID_REQUEST",
-                    "request_id must be an integer")
-                continue
-
-            action = header.get("action")
-
-            # 4. Pending transfer enforcement
-            if pending_transfer is not None:
-                if (action != "ACK"
-                    or header.get("ack_for_request_id")
-                       != pending_transfer["request_id"]):
-                    send_error(sock, header, "INVALID_REQUEST",
-                        "Expected ACK, protocol violation")
-                    break  # connection closed
-
-                if pending_transfer["kind"] == "DOWNLOAD":
-                    with state_manager.lock:
-                        state_manager.downloads.setdefault(
-                            client_id, set()
-                        ).add(pending_transfer["app_name"])
-                        save_downloads_registry()
-                # For PUSH_UPDATE: just log, no registry change
-                pending_transfer = None
-                continue
-
-            # 5. Normal message routing (no pending_transfer)
-            if action == "ACK":
-                send_error(sock, header, "INVALID_REQUEST",
-                    "No transfer pending")
-                # Connection stays open
-
-            elif action == "HELLO":
-                ...
-            elif action == "LIST_APPS":
-                ...
-            elif action == "DOWNLOAD":
-                # validate app_name, prepare response
-                try:
-                    send_message(sock, file_transfer_header, binary_data)
-                except (ConnectionError, ConnectionResetError, OSError):
-                    break
-                # Set pending_transfer ONLY AFTER send succeeds
-                pending_transfer = {
-                    "request_id": header["request_id"],
-                    "kind": "DOWNLOAD",
-                    "app_name": header["app_name"],
-                    "version": app_version,
-                    "since": time.time()
-                }
-            elif action == "CHECK_UPDATES":
-                ...
-            elif action == "DISCONNECT":
-                break
-            else:
-                send_error(sock, header, "INVALID_REQUEST",
-                    f"Unknown action: {action}")
-
-        # 6. Only if no client input AND no pending transfer, send a push
-        if not readable and pending_transfer is None:
-            task = None
-            with state_manager.lock:
-                pushes = state_manager.pending_pushes.get(
-                    client_id, {})
-                if pushes:
-                    app_name = next(iter(pushes))
-                    task = pushes.pop(app_name)
-            if task is not None:
-                try:
-                    send_message(sock, push_header, task["file_data"])
-                except (ConnectionError, ConnectionResetError, OSError):
-                    break
-                # Set pending_transfer ONLY AFTER send succeeds
-                pending_transfer = {
-                    "request_id": task["request_id"],
-                    "kind": "PUSH_UPDATE",
-                    "app_name": task["app_name"],
-                    "version": task["version"],
-                    "since": time.time()
-                }
-
-    # Cleanup — race-condition-safe (see Section 23)
-    cleanup(sock, client_id, state_manager)
-```
-
-**Key properties:**
-- `select.select()` checks data availability before calling `recv_message()`.
-- Once `select()` triggers, `sock.settimeout(FRAME_TIMEOUT)` is set in a `try/finally` that guarantees `sock.settimeout(None)` is always restored. Protocol-level corruption (timeout mid-frame, bad JSON, non-dict header, invalid `file_size`) causes immediate connection closure with no ERROR response.
-- **`request_id` is validated explicitly** before any routing: missing → `MISSING_FIELD`, non-integer → `INVALID_REQUEST`. Both keep the connection open.
-- **Pending transfer is strictly enforced.** If `pending_transfer` is set, only a matching ACK is accepted. Anything else triggers ERROR + connection closure.
-- **Unexpected ACK** (when `pending_transfer is None`) gets an ERROR response (`INVALID_REQUEST`) but the connection stays open.
-- **`pending_transfer` is set only after `send_message()` succeeds.** If the send fails, the exception is caught and the loop breaks — no false state.
-- **Client messages are always processed first.** Pushes are only sent when there is no incoming client data and no pending transfer awaiting ACK.
-- The handler never blocks waiting for a specific ACK inline. It sends the file, records `pending_transfer`, and continues the loop. The ACK arrives naturally through the recv path.
-- Only one pending file transfer at a time per client (enforced by `pending_transfer` gate).
-- `pending_transfer` contains `kind`, `app_name`, and `version`, making ACK routing completely unambiguous.
-- **`send_error` uses `request_id` from the received header if it exists and is an integer, otherwise `0`.**
-
----
-
-## 20. Client Update Behavior
-
-**File: `client/src/update_manager.py`**
-
-When the client receives a file (from FILE_TRANSFER or PUSH_UPDATE):
-
-1. Compute hash of received data. Compare with hash in header.
-2. **If mismatch:** print error, do NOT save, do NOT send ACK. Done.
-3. **If match:** check if `downloads/<app_name>.lock` exists.
-4. **No lock:** save using atomic replacement:
-   - Write to `downloads/<app_name>.tmp`
-   - `os.replace("downloads/<app_name>.tmp", "downloads/<app_name>")`
-   - Update `client_state.json` (version and hash now reflect the new file)
-   - Send ACK.
-5. **Lock exists:**
-   - Write binary to `pending_updates/<app_name>.tmp`, then `os.replace("pending_updates/<app_name>.tmp", "pending_updates/<app_name>.new")`
-   - Write metadata to `pending_updates/<app_name>.meta.tmp` containing `{"version": 3, "hash": "..."}`, then `os.replace("pending_updates/<app_name>.meta.tmp", "pending_updates/<app_name>.meta")`
-   - If `.new` and `.meta` already exist for this app (older pending update), they are **overwritten** — only the latest pending version is kept
-   - Do **NOT** update `client_state.json` — the officially installed version remains the old one
-   - Send ACK.
-
-**`client_state.json` is updated only when a file is actually placed in `downloads/`.** This ensures that on reconnection, CHECK_UPDATES accurately reports what is truly installed, not what is merely pending.
-
----
-
-## 21. Simulating "Application is Running"
-
-- `downloads/calculator.exe.lock` exists → app is running, cannot be overwritten.
-- `downloads/calculator.exe.lock` absent → app is not running.
-- Client console commands: `lock calculator.exe` and `unlock calculator.exe` create/delete the lock file.
-- No actual process checking needed.
-
----
-
-## 22. Retry Worker
-
-**File: `client/src/retry_worker.py`**
-
-A background daemon thread running continuously:
-
-```
-every RETRY_INTERVAL (5 seconds):
-    acquire local_state.lock
-
-    # First pass: clean up orphaned .meta files (no corresponding .new)
-    scan pending_updates/ folder for *.meta files
-    for each file like "calculator.exe.meta":
-        if "calculator.exe.new" does NOT exist:
-            log "[RETRY] WARNING: calculator.exe.meta found without .new, deleting orphaned metadata"
-            delete "calculator.exe.meta"
-
-    # Second pass: handle pending updates
-    scan pending_updates/ folder for *.new files
-    for each file like "calculator.exe.new":
-
-        if "calculator.exe.meta" does NOT exist:
-            log "[RETRY] ERROR: calculator.exe.new found without .meta, deleting orphaned binary"
-            delete "calculator.exe.new"
-            continue
-
-        check if downloads/calculator.exe.lock exists
-
-        if no lock:
-            read pending_updates/calculator.exe.meta to get version and hash
-            os.replace("pending_updates/calculator.exe.new",
-                       "downloads/calculator.exe")
-            update client_state.json with version and hash from .meta
-            os.remove("pending_updates/calculator.exe.meta")
-            print "[RETRY] Applied update for calculator.exe"
-
-        if lock exists:
-            print "[RETRY] calculator.exe still locked, retrying..."
-
-    release local_state.lock
-```
-
-Key rules:
-- Uses `os.replace()` for atomic replacement.
-- **This is the only place where `client_state.json` is updated for pending updates.**
-- **Orphan handling (two cases):**
-  - `.meta` without `.new`: the first pass detects and deletes it. Metadata alone is useless without the binary.
-  - `.new` without `.meta`: the second pass detects and deletes it. The binary cannot be safely applied without knowing its version and hash.
-- After `os.replace()` succeeds: update `client_state.json`, then **explicitly delete** `calculator.exe.meta`. The `.new` file is already gone (consumed by `os.replace()`). If `.meta` is left behind, a future update that fails before writing its own `.meta` could cause the worker to read stale version/hash data.
-
----
-
-## 23. Connection Handling and Race-Condition-Safe Cleanup
-
-**No heartbeat.** Disconnection detected via `ConnectionError`, `ConnectionResetError`, or zero bytes.
-
-**On disconnect detection (server-side cleanup):**
-
-```python
-def cleanup(sock, client_id, state_manager):
-    with state_manager.lock:
-        # Only remove if this socket is still the active one
-        if state_manager.active_clients.get(client_id) is sock:
-            del state_manager.active_clients[client_id]
-            state_manager.pending_pushes.pop(client_id, None)
-    sock.close()
-    # Download history is NEVER removed
-```
-
-**The `is sock` check is critical.** If a new connection from the same `client_id` has already replaced this socket in `active_clients`, the old handler must **not** remove the new entry. The identity comparison ensures only the rightful owner cleans up.
-
-**On reconnection:** Client sends HELLO (same `client_id`). If old socket still in `active_clients`, the new one replaces it (old socket closed by HELLO handler). Then client sends CHECK_UPDATES, which also resynchronizes the download registry.
-
----
-
-## 24. Test Data
-
-Three pre-loaded applications:
-
-```
-calculator.exe    version 1    1 KB of random bytes
-notes.exe         version 1    5 KB of random bytes
-game.exe          version 1    20 KB of random bytes
-```
-
-Generate with:
-
-```python
-import os
-os.makedirs("server/apps", exist_ok=True)
-with open("server/apps/calculator.exe", "wb") as f:
-    f.write(os.urandom(1024))
-with open("server/apps/notes.exe", "wb") as f:
-    f.write(os.urandom(5120))
-with open("server/apps/game.exe", "wb") as f:
-    f.write(os.urandom(20480))
-```
-
-For **reproducible** demo binaries (same sizes: 1024 / 5120 / 20480 bytes), use [`generate_demo_apps.py`](generate_demo_apps.py) at the repository root; it fills each file by repeating a short label prefix to the exact length and resets the manifest and registry (restart the server afterward).
-
----
-
-## 25. Demo Scenarios
-
-```
- #   Scenario                                                What happens
-───  ──────────────────────────────────────────────────────   ──────────────────────────────────────────────
- 1   Start server in Docker                                  docker build + docker run
- 2   Connect client_mara and client_antonia                  Both send HELLO
- 3   Both request LIST_APPS                                  See all 3 apps
- 4   client_mara downloads calculator.exe                    DOWNLOAD -> FILE_TRANSFER -> ACK
- 5   client_antonia downloads calculator.exe and notes.exe   Same flow, twice
- 6   Server publishes calculator.exe v2                      Operator types "publish calculator.exe"
- 7   Both mara and antonia get PUSH_UPDATE                   Sent via handler threads, ACK through recv loop
- 8   client_mara downloads notes.exe, locks it,              Update -> pending_updates (.new + .meta),
-     server publishes notes.exe v2                           client_state.json still v1, retry applies
-                                                             after unlock, updates state, deletes .meta
- 9   client_auxeniu connects, downloads calculator.exe       Gets v2 directly
-10   client_mara disconnects, server publishes calc v3       mara is offline
-11   client_mara reconnects, CHECK_UPDATES                   Server resynchronizes registry, sends v3
-```
-
-### 25.1 Demo / video runbook (roles and expected output)
-
-| Role | Responsibility |
-|------|------------------|
-| **Operator** | Runs the server (host or Docker), overwrites files under `server/apps/` before `publish`, types `publish <app_name>` and reads `[PUBLISH ERROR]` / `Published … vN for clients: [...]` |
-| **Client A (`client_mara`)** | `python -m client.src.main_client --client-id client_mara --client-instance client_mara` — `list`, `download`, optional `lock` / `unlock` |
-| **Client B (`client_antonia`)** | Same pattern with `--client-id client_antonia --client-instance client_antonia` |
-| **Client C (`client_auxeniu`)** | Joins later to download current manifest version |
-
-**Suggested order (matches the table above):**
-
-1. **Operator:** start server (`python -m server.src.server_main` or `docker compose up --build`). Expect: `Server listening on 0.0.0.0:9000` and `Available commands:`.
-2. **Clients A & B:** start both; expect `[SERVER] Client connected as …` per HELLO, then `list` shows three apps with versions and hashes.
-3. **Downloads:** each `download` completes with client `Download completed`; server logs show FILE_TRANSFER handling; after ACK, `server/data/downloads_registry.json` lists each `client_id` with downloaded app names.
-4. **Operator:** overwrite `server/apps/calculator.exe`, then `publish calculator.exe`. Expect: `Published calculator.exe v2 for clients: ['client_antonia', 'client_mara']` (or subset). Connected clients should receive `PUSH_UPDATE` and ACK; server should not log ACK timeout for a successful round-trip.
-5. **Offline / reconnect:** disconnect one client (client `exit`); operator publishes again; reconnect same `--client-id` / `--client-instance`. Expect automatic `CHECK_UPDATES` after HELLO, then downloads for newer versions; registry resync if needed (Section 8).
-
-Printable step lists (no automation): [`scripts/run_demo.ps1`](scripts/run_demo.ps1), [`scripts/run_demo.sh`](scripts/run_demo.sh).
-
----
-
-## 26. Client-Side Functionality and Validation
-
-This section describes the client-side implementation, focusing on:
-
-* local application management
-* delayed updates for locked applications
-* retry mechanism for pending updates
-* reconnection behavior
-* isolation between multiple client instances
-
----
-
-## 27. Client Storage Structure
-
-Each client instance maintains its own isolated directory structure:
+The main network configuration is defined in:
 
 ```text
-client_instances/<instance_name>/
-├── downloads/
-├── pending_updates/
-└── data/
-    └── client_state.json
+shared/src/config.py
 ```
 
-This ensures:
+Default server configuration:
 
-* complete separation of installed files
-* independent pending updates
-* isolated local state (`client_state.json`)
-* no interference between instances
+```python
+HOST = "0.0.0.0"
+PORT = 9000
+BUFFER_SIZE = 4096
+SOCKET_TIMEOUT = 5
+FRAME_TIMEOUT = 10
+ACK_TIMEOUT = 10
+RETRY_INTERVAL = 5
+```
 
----
+The server listens on all interfaces on port `9000`.
 
-## 28. Client Commands
-
-The client provides an interactive interface with the following commands:
+Clients connect by default to:
 
 ```text
-help
-list
-download <app_name>
-check
-lock <app_name>
-unlock <app_name>
-state
-pending
-exit
+127.0.0.1:9000
 ```
 
-### Description
-
-* `list` — requests available applications from the server
-* `download` — downloads a specific application
-* `check` — checks for updates and downloads them sequentially
-* `lock` / `unlock` — simulate application usage via `.lock` files
-* `state` — displays installed applications
-* `pending` — displays pending updates
-* `exit` — disconnects from the server
+or to the corresponding Docker host address.
 
 ---
 
-## 29. Local Update Mechanism
+## Communication Protocol
 
-### Direct Installation
+The project implements a custom application-level protocol on top of TCP.
 
-If the application is not locked:
+Every message has the following structure:
 
-* the file is written directly into `downloads/`
-* `client_state.json` is updated immediately
-* an `ACK` is sent after successful installation
+```text
+[4 bytes: JSON header length]
+[N bytes: JSON header encoded as UTF-8]
+[optional binary payload]
+```
 
-### Pending Updates
+The first four bytes contain the JSON header length as a **big-endian unsigned integer**.
 
-If the application is locked:
+If the header contains a positive `file_size`, exactly that number of binary bytes follows the JSON header.
 
-* the update is stored as:
+Binary payloads are used for:
 
-  * `pending_updates/<app>.new`
-  * `pending_updates/<app>.meta`
-* `client_state.json` is not updated
-* `ACK` is still sent
+* `FILE_TRANSFER`
+* `PUSH_UPDATE`
 
----
+The shared protocol implementation is located in:
 
-## 30. Retry Worker
-
-A background thread periodically attempts to apply pending updates.
-
-If:
-
-* both `.new` and `.meta` exist
-* the application is no longer locked
-
-then:
-
-* the file replaces the installed version (`os.replace`)
-* `client_state.json` is updated
-* temporary files are removed
-
-The worker also removes inconsistent states:
-
-* `.meta` without `.new`
-* `.new` without `.meta`
+```text
+shared/src/protocol.py
+```
 
 ---
 
-## 31. Client State Representation
+## Message Types
 
-`client_state.json` contains only installed applications:
+### Client → Server
+
+```text
+HELLO
+LIST_APPS
+DOWNLOAD
+CHECK_UPDATES
+ACK
+DISCONNECT
+```
+
+### Server → Client
+
+```text
+LIST_RESPONSE
+FILE_TRANSFER
+PUSH_UPDATE
+CHECK_UPDATES_RESPONSE
+ERROR
+```
+
+Every message contains:
+
+```text
+action
+request_id
+```
+
+Server responses also contain a status:
+
+```text
+OK
+ERROR
+```
+
+The `client_id` is transmitted during the initial `HELLO` exchange. After registration, the server associates the client identity with its socket.
+
+---
+
+## Client Registration
+
+Immediately after establishing the TCP connection, the client sends a `HELLO` message.
+
+Example:
+
+```json
+{
+  "action": "HELLO",
+  "request_id": 1,
+  "client_id": "client_mara"
+}
+```
+
+The server registers the client and responds with a confirmation.
+
+If another connection using the same `client_id` already exists, the new connection replaces the old one.
+
+---
+
+## Application Listing
+
+Clients can request the applications currently available on the server.
+
+Example response:
+
+```json
+{
+  "status": "OK",
+  "action": "LIST_RESPONSE",
+  "request_id": 2,
+  "apps": [
+    {
+      "name": "calculator.exe",
+      "version": 1,
+      "hash": "..."
+    },
+    {
+      "name": "notes.exe",
+      "version": 1,
+      "hash": "..."
+    },
+    {
+      "name": "game.exe",
+      "version": 1,
+      "hash": "..."
+    }
+  ]
+}
+```
+
+Each application is represented by:
+
+* name;
+* version;
+* SHA-256 hash.
+
+---
+
+## Application Download
+
+A client can request an application using `DOWNLOAD`.
+
+The transfer follows three main steps:
+
+```text
+Client                         Server
+  |                               |
+  | -------- DOWNLOAD ----------> |
+  |                               |
+  | <--- FILE_TRANSFER + file --- |
+  |                               |
+  | ---------- ACK -------------> |
+```
+
+The server sends a JSON header followed by the binary file contents.
+
+After receiving the file, the client:
+
+1. computes its SHA-256 hash;
+2. compares it with the hash provided by the server;
+3. saves the file;
+4. sends an `ACK`.
+
+The acknowledgment is sent only if both integrity verification and file storage succeed.
+
+---
+
+## File Integrity
+
+SHA-256 is used to verify transferred files.
+
+The hash implementation is shared between the client and server.
+
+Hashes are represented as lowercase hexadecimal strings.
+
+The version number determines whether an application is newer, while the hash is used to verify file integrity.
+
+---
+
+## Application Versions
+
+Each application starts at:
+
+```text
+version 1
+```
+
+When the server operator publishes another version, its version number is incremented.
+
+The application manifest is persisted in:
+
+```text
+server/data/apps_manifest.json
+```
+
+It stores information such as:
+
+```json
+{
+  "calculator.exe": {
+    "name": "calculator.exe",
+    "version": 2,
+    "hash": "...",
+    "file_path": "calculator.exe"
+  }
+}
+```
+
+---
+
+## Publishing Updates
+
+A new version can be published from the server console.
+
+First, the application file in:
+
+```text
+server/apps/
+```
+
+is replaced with the new version.
+
+Then the operator runs:
+
+```text
+publish calculator.exe
+```
+
+The server:
+
+1. reads the new file;
+2. computes its SHA-256 hash;
+3. increments the application version;
+4. updates the application manifest;
+5. identifies clients that previously downloaded the application;
+6. queues an update for connected clients.
+
+The publisher does not directly access client sockets. Updates are placed into the corresponding client's pending push queue and are sent by the client's own handler thread.
+
+---
+
+## Automatic Push Updates
+
+Connected clients that previously downloaded an application can receive a new version automatically through:
+
+```text
+PUSH_UPDATE
+```
+
+The pushed message contains:
+
+* application name;
+* new version;
+* SHA-256 hash;
+* binary file size;
+* binary file contents.
+
+After successfully storing and verifying the update, the client sends an `ACK`.
+
+Only one file transfer can be pending for a client at a time.
+
+If multiple versions of the same application are published before a pending push is sent, only the newest pending version is retained.
+
+---
+
+## Offline Clients and Reconnection
+
+Clients that are offline when a new version is published receive the update after reconnecting.
+
+After the initial `HELLO`, the client automatically sends:
+
+```text
+CHECK_UPDATES
+```
+
+with information about the applications currently installed locally.
+
+The server compares the client's versions with the current server versions and returns only applications for which newer versions exist.
+
+The client then downloads the updates sequentially using the normal:
+
+```text
+DOWNLOAD → FILE_TRANSFER → ACK
+```
+
+flow.
+
+`CHECK_UPDATES` also allows the server to resynchronize its download registry with the applications actually installed by the client.
+
+---
+
+## Locked Applications and Pending Updates
+
+The project simulates an application currently being used through `.lock` files.
+
+For example:
+
+```text
+downloads/calculator.exe.lock
+```
+
+indicates that `calculator.exe` is currently locked.
+
+If an update arrives while the application is locked, the installed file is not overwritten.
+
+Instead, the update is stored as:
+
+```text
+pending_updates/calculator.exe.new
+pending_updates/calculator.exe.meta
+```
+
+The `.new` file contains the new binary, while `.meta` contains its version and hash.
+
+The installed version recorded in `client_state.json` remains unchanged until the update is actually applied.
+
+---
+
+## Retry Worker
+
+Each client runs a background retry worker.
+
+The worker checks pending updates every:
+
+```text
+5 seconds
+```
+
+If the application is no longer locked, the pending update is applied using:
+
+```python
+os.replace()
+```
+
+The local application state is then updated.
+
+The retry worker also detects and removes inconsistent pending-update states:
+
+* `.meta` without `.new`;
+* `.new` without `.meta`.
+
+This prevents corrupted or incomplete pending updates from being applied.
+
+---
+
+## Persistent State
+
+### Server State
+
+The server maintains:
+
+```text
+server/data/apps_manifest.json
+server/data/downloads_registry.json
+```
+
+`apps_manifest.json` stores application versions and hashes.
+
+`downloads_registry.json` records which applications were downloaded by each client.
+
+Example:
+
+```json
+{
+  "client_mara": [
+    "calculator.exe",
+    "notes.exe"
+  ],
+  "client_antonia": [
+    "calculator.exe"
+  ]
+}
+```
+
+---
+
+### Client State
+
+Each client maintains its own:
+
+```text
+client_state.json
+```
+
+Example:
 
 ```json
 {
@@ -1154,59 +531,278 @@ The worker also removes inconsistent states:
 }
 ```
 
-Important:
+The state contains only applications that are actually installed.
 
-* updated only after successful installation in `downloads/`
-* never reflects pending updates
-
----
-
-## 32. Reconnection Behavior
-
-Upon reconnection, the client automatically:
-
-1. sends `HELLO`
-2. sends `CHECK_UPDATES`
-3. downloads missing updates sequentially
-
-This guarantees consistency even after offline periods.
+Updates waiting in `pending_updates/` are not considered installed and therefore do not modify this file.
 
 ---
 
-## 33. Running the Client
+## Multiple Client Instances
 
-Start a client instance:
+Different clients use isolated local directories:
+
+```text
+client_instances/<instance_name>/
+├── downloads/
+├── pending_updates/
+└── data/
+    └── client_state.json
+```
+
+This provides independent:
+
+* downloaded files;
+* pending updates;
+* application locks;
+* local state.
+
+Multiple client instances can therefore communicate with the same server without interfering with one another.
+
+---
+
+## Server Concurrency
+
+The server supports multiple simultaneous clients using Python threads.
+
+The architecture uses:
+
+* one accept loop for incoming TCP connections;
+* one handler thread for each connected client.
+
+A key design rule is that only the corresponding handler thread reads from and writes to a client's socket.
+
+Shared server state is protected using:
+
+```python
+threading.Lock()
+```
+
+The server maintains:
+
+* registered applications;
+* download history;
+* active client sockets;
+* pending push updates;
+* server-side request IDs.
+
+Socket availability is checked with:
+
+```python
+select.select()
+```
+
+before attempting to read a complete message frame.
+
+---
+
+## Timeouts and Error Handling
+
+The protocol distinguishes between frame-level and message-level errors.
+
+Frame-level problems such as:
+
+* incomplete frames;
+* malformed JSON;
+* invalid UTF-8;
+* invalid binary payload sizes;
+
+cause the connection to be closed because the message stream can no longer be considered synchronized.
+
+Message-level errors produce structured `ERROR` responses.
+
+Examples include:
+
+```text
+INVALID_REQUEST
+MISSING_FIELD
+APP_NOT_FOUND
+CLIENT_NOT_REGISTERED
+INTERNAL_ERROR
+```
+
+After sending a file, the server also expects an acknowledgment within the configured ACK timeout.
+
+If the expected `ACK` is not received, the transfer is considered unsuccessful and the connection is closed.
+
+---
+
+## Atomic File Updates
+
+Temporary files and `os.replace()` are used when installing or applying updates.
+
+For a normal installation, the file is first written to:
+
+```text
+downloads/<app_name>.tmp
+```
+
+and then atomically moved to:
+
+```text
+downloads/<app_name>
+```
+
+Pending updates use the same approach before producing their final `.new` and `.meta` files.
+
+This reduces the risk of leaving partially written installed files.
+
+---
+
+## Running the Server Locally
+
+Run the following command from the repository root:
+
+```bash
+python -m server.src.server_main
+```
+
+The server listens on:
+
+```text
+0.0.0.0:9000
+```
+
+Available server commands:
+
+```text
+help
+publish <app_name>
+apps
+clients
+exit
+```
+
+---
+
+## Running the Server with Docker
+
+Build the image from the repository root:
+
+```bash
+docker build -f server/Dockerfile -t app-store-server .
+```
+
+Run the container:
+
+```bash
+docker run --rm -it -p 9000:9000 \
+  -v ./server/data:/app/server/data \
+  -v ./server/apps:/app/server/apps \
+  app-store-server
+```
+
+The project can also be started using Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+The mounted volumes preserve the server application files and JSON state outside the container.
+
+---
+
+## Running a Client
+
+Example:
 
 ```bash
 python -m client.src.main_client --client-id client_mara --client-instance client_mara
 ```
 
-Start multiple isolated instances:
+Multiple isolated clients can be started using different IDs and instance names:
 
 ```bash
-python -m client.src.main_client --client-id client_a --client-instance client_a
-python -m client.src.main_client --client-id client_b --client-instance client_b
+python -m client.src.main_client --client-id client_mara --client-instance client_mara
+python -m client.src.main_client --client-id client_antonia --client-instance client_antonia
+python -m client.src.main_client --client-id client_auxeniu --client-instance client_auxeniu
+```
+
+The server address and port can also be specified explicitly:
+
+```bash
+python -m client.src.main_client \
+  --client-id client_mara \
+  --client-instance client_mara \
+  --host 127.0.0.1 \
+  --port 9000
 ```
 
 ---
 
-## 34. Generating Demo Applications
+## Client Commands
 
-To recreate demo applications with the **exact sizes from Section 24** (1024 / 5120 / 20480 bytes, deterministic content):
+The interactive client provides the following commands:
+
+```text
+help
+list
+download <app_name>
+check
+lock <app_name>
+unlock <app_name>
+state
+pending
+exit
+```
+
+Their roles are:
+
+| Command               | Description                                   |
+| --------------------- | --------------------------------------------- |
+| `help`                | Displays the available commands               |
+| `list`                | Requests the list of server applications      |
+| `download <app_name>` | Downloads an application                      |
+| `check`               | Checks for newer versions and downloads them  |
+| `lock <app_name>`     | Simulates an application currently being used |
+| `unlock <app_name>`   | Removes the application lock                  |
+| `state`               | Displays locally installed applications       |
+| `pending`             | Displays pending updates                      |
+| `exit`                | Disconnects the client                        |
+
+---
+
+## Demo Applications
+
+The repository contains three demo applications:
+
+```text
+calculator.exe
+notes.exe
+game.exe
+```
+
+Their initial sizes are:
+
+| Application      |  Size |
+| ---------------- | ----: |
+| `calculator.exe` |  1 KB |
+| `notes.exe`      |  5 KB |
+| `game.exe`       | 20 KB |
+
+They are binary demo files used to test application distribution and update behavior.
+
+They can be regenerated with:
 
 ```bash
 python generate_demo_apps.py
 ```
 
-This overwrites `calculator.exe`, `notes.exe`, and `game.exe` under `server/apps/`, and resets `server/data/apps_manifest.json` and `server/data/downloads_registry.json` to `{}`.
+The script also resets:
 
-**Restart the server** after execution so it bootstraps the manifest from disk and recomputes SHA-256 hashes.
+```text
+server/data/apps_manifest.json
+server/data/downloads_registry.json
+```
+
+After running it, the server should be restarted so that the manifest is rebuilt from the generated application files.
 
 ---
 
-## 35. Validation Scripts
+## Validation and Testing
 
-### Local Validation
+The project includes dedicated validation scripts for the main client-side and networking scenarios.
+
+### Client update and retry validation
 
 ```bash
 python tests/test_client_retry.py
@@ -1214,13 +810,14 @@ python tests/test_client_retry.py
 
 Covers:
 
-* installation logic
-* pending updates
-* retry mechanism
-* orphan cleanup
-* hash validation
+* direct installation;
+* pending updates;
+* locked applications;
+* retry behavior;
+* orphaned update cleanup;
+* hash verification.
 
-### Multi-Instance Validation
+### Multiple client instances
 
 ```bash
 python tests/validate_two_instances.py
@@ -1228,11 +825,11 @@ python tests/validate_two_instances.py
 
 Covers:
 
-* simultaneous clients
-* directory isolation
-* independent state
+* simultaneous clients;
+* directory isolation;
+* independent client state.
 
-### Reconnection Validation
+### Reconnection
 
 ```bash
 python tests/validate_reconnect.py
@@ -1240,20 +837,45 @@ python tests/validate_reconnect.py
 
 Covers:
 
-* offline updates
-* reconnect behavior
-* automatic synchronization
+* application download;
+* client disconnection;
+* publishing a new version while the client is offline;
+* reconnection;
+* automatic update synchronization.
 
 ---
 
-## 36. Summary
+## Main Concepts Implemented
 
-The client implementation provides:
+The project demonstrates:
 
-* reliable local file management
-* safe update handling under file locks
-* automatic retry for delayed updates
-* consistent state synchronization after reconnect
-* full isolation between multiple client instances
+* TCP client–server communication;
+* a custom application-level protocol;
+* binary file transfer;
+* message framing;
+* request/response correlation using request IDs;
+* acknowledgments for completed file transfers;
+* SHA-256 integrity verification;
+* application version management;
+* server-initiated push updates;
+* offline update synchronization;
+* concurrent client handling;
+* shared-state synchronization using locks;
+* event-driven socket handling using `select`;
+* persistent server and client state using JSON;
+* atomic file replacement;
+* delayed updates for locked applications;
+* background retry processing;
+* multiple isolated client instances;
+* protocol and connection error handling;
+* Docker-based server deployment.
 
 ---
+
+## Authors
+
+Team project developed by:
+
+* **Mazâlu Mara**
+* **Miclescu Razvan-Auxeniu**
+* **Mitu Ana-Maria-Antonia**
